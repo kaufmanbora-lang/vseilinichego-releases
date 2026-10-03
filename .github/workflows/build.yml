@@ -1,0 +1,215 @@
+# PUBLIC BUILD of «ВСЁ ИЛИ НИЧЕГО» (free GitHub Actions minutes for a public repo). The source stays private: each job
+# checks out kaufmanbora-lang/vseilinichego with a read-only deploy key (secret SRC_DEPLOY_KEY). Generated from the
+# private repo's .github/workflows/release.yml by its scripts — do not edit here by hand.
+#   gh workflow run build.yml -R kaufmanbora-lang/vseilinichego-releases [-f ref=main]
+# Installers for Windows (NSIS), macOS (dmg, universal: Intel + Apple Silicon) and Linux (AppImage + deb), built on
+# GitHub's machines, then INSTALLED AND STARTED on clean machines of several versions of each system: the app runs with
+# VSE_SMOKE=<file> (app/main.mjs) — no window, it waits until the game page has really started (loading screen gone or
+# the login gate shown; a boot error fails at once), writes «SMOKE OK …» and quits.
+# macOS also gets the signed update feed (latest-mac.yml.sig, key = secret MAC_FEED_KEY) and, with e2e_update, a full
+# update test: a second build one patch version up is served from a local feed and the installed game updates itself
+# (scripts/ci/mac-update-e2e.sh).
+# Run: gh workflow run release.yml   → the files are the run's artifacts (gh run download), published by hand
+# (a macOS release needs the dmg, the zip, latest-mac.yml AND latest-mac.yml.sig of the same run).
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit of kaufmanbora-lang/vseilinichego to build'
+        default: 'main'
+      base:
+        description: 'Server / site address'
+        default: 'https://vseilinichego.com'
+      e2e_update:
+        description: 'macOS: end-to-end test of the auto-update'
+        type: boolean
+        default: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            # ASCII product name on macOS: the helper bundles are named «<productName> Helper.app»; with «Всё или ничего» the
+            # dmg (HFS+) stores the names decomposed (NFD), a copy to /Applications keeps them, Electron looks the helpers up
+            # by the composed name and stops at once (SIGTRAP). The Dock / Finder name stays «Всё или ничего» (CFBundleDisplayName).
+            target: --mac -c.mac.identity=- -c.mac.hardenedRuntime=false -c.productName=VseIliNichego
+          - os: ubuntu-24.04
+            target: --linux
+          - os: windows-2022
+            target: --win
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: kaufmanbora-lang/vseilinichego, ref: '${{ inputs.ref }}', ssh-key: '${{ secrets.SRC_DEPLOY_KEY }}', persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/stage-app.mjs --server "${BASE/http/ws}" --site "$BASE"
+        env: { BASE: '${{ inputs.base }}' }
+        shell: bash
+      - run: npx electron-builder ${{ matrix.target }} --publish never
+        env:
+          VSE_UPDATE_URL: '${{ inputs.base }}/dl'
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: sign the macOS update feed
+        if: runner.os == 'macOS'
+        run: node scripts/sign-feed.mjs dist/release
+        env: { MAC_FEED_KEY: '${{ secrets.MAC_FEED_KEY }}' }
+      - name: e2e — build B (one patch version up, zip only) and sign its test feed
+        if: runner.os == 'macOS' && inputs.e2e_update
+        shell: bash
+        run: |
+          set -e
+          VB=$(node -p "const v=require('./package.json').version.split('.').map(Number);v[2]++;v.join('.')")
+          echo "B = $VB"
+          npx electron-builder --mac zip --universal -c.mac.identity=- -c.mac.hardenedRuntime=false -c.productName=VseIliNichego -c.extraMetadata.version=$VB -c.directories.output=dist/e2e-b --publish never
+          ls -la dist/e2e-b
+          node scripts/sign-feed.mjs dist/e2e-b --e2e
+        env:
+          VSE_UPDATE_URL: '${{ inputs.base }}/dl'
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          MAC_FEED_KEY: '${{ secrets.MAC_FEED_KEY }}'
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS' && inputs.e2e_update
+        with:
+          name: e2e-mac-update
+          retention-days: 1
+          path: |
+            dist/e2e-b/*.zip
+            dist/e2e-b/latest-mac.yml
+            dist/e2e-b/latest-mac.yml.sig
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ runner.os }}
+          path: |
+            dist/release/*.dmg
+            dist/release/*.zip
+            dist/release/*.AppImage
+            dist/release/*.deb
+            dist/release/*.exe
+            dist/release/latest*.yml
+            dist/release/*.sig
+            dist/release/*.blockmap
+
+  test-macos:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: installers-macOS, path: inst }
+      - name: install from the dmg like a player and start
+        shell: bash
+        # (the Intel runner is a VM without any working WebGL: there the smoke accepts exactly that error — see app/main.mjs)
+        env: { VSE_SMOKE_NOGL: "${{ matrix.os == 'macos-15-intel' && '1' || '' }}" }
+        run: |
+          set -e
+          sw_vers; uname -m
+          hdiutil attach inst/*.dmg -nobrowse -mountpoint /tmp/vse
+          ls -la /tmp/vse; ls -a /tmp/vse | grep -q '^[.]background'   # (the window background: .background.tiff)
+          SRC=$(ls -d /tmp/vse/*.app | head -1)
+          cp -R "$SRC" /Applications/
+          APP="/Applications/$(basename "$SRC")"
+          hdiutil detach /tmp/vse
+          BIN="$APP/Contents/MacOS/$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
+          lipo -archs "$BIN"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          spctl --assess --type execute -vv "$APP" || echo "(Gatekeeper: not notarized — expected without an Apple developer ID)"
+          export ELECTRON_ENABLE_LOGGING=1
+          VSE_SMOKE=/tmp/smoke.txt "$BIN" --ignore-gpu-blocklist --enable-unsafe-swiftshader > /tmp/run.log 2>&1 || echo "exit code $?"
+          if ! grep -q "SMOKE OK" /tmp/smoke.txt 2>/dev/null; then
+            echo "---- smoke result"; cat /tmp/smoke.txt 2>/dev/null || echo "(none)"
+            echo "---- app log"; tail -60 /tmp/run.log
+            echo "---- crash reports"; for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -2); do echo "== $f"; head -c 6000 "$f"; echo; done
+            exit 1
+          fi
+          cat /tmp/smoke.txt
+
+  test-macos-update:
+    needs: build
+    if: inputs.e2e_update
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: kaufmanbora-lang/vseilinichego, ref: '${{ inputs.ref }}', ssh-key: '${{ secrets.SRC_DEPLOY_KEY }}', persist-credentials: false }
+        with: { sparse-checkout: scripts/ci }
+      - uses: actions/download-artifact@v4
+        with: { name: installers-macOS, path: inst }
+      - uses: actions/download-artifact@v4
+        with: { name: e2e-mac-update, path: e2e }
+      - name: first launch from the dmg, then update itself from a signed local feed
+        shell: bash
+        env: { VSE_SMOKE_NOGL: "${{ matrix.os == 'macos-15-intel' && '1' || '' }}" }
+        run: bash scripts/ci/mac-update-e2e.sh inst/*.dmg e2e
+
+  test-linux:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: installers-Linux, path: inst }
+      - name: AppImage and deb, started
+        shell: bash
+        run: |
+          set -e
+          cat /etc/os-release | head -2
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb > /dev/null
+          # runners have no GPU: Chromium's software WebGL is allowed for the test only (players have real GPUs)
+          GL="--ignore-gpu-blocklist --enable-unsafe-swiftshader"
+          AI=$(ls inst/*.AppImage | head -1); chmod +x "$AI"
+          # like a double-click on a fresh Ubuntu: no libfuse2, no --appimage-extract-and-run (static runtime, fuse3)
+          sudo apt-get remove -y -qq libfuse2 libfuse2t64 > /dev/null 2>&1 || true; ls /dev/fuse; which fusermount3 || sudo apt-get install -y -qq fuse3 > /dev/null
+          VSE_SMOKE=/tmp/smoke0.txt xvfb-run -a "$AI" $GL > /tmp/run0.log 2>&1 || true
+          cat /tmp/smoke0.txt || { echo "AppImage (direct): no smoke result"; tail -40 /tmp/run0.log; exit 1; }
+          grep -q "SMOKE OK" /tmp/smoke0.txt
+          VSE_SMOKE=/tmp/smoke1.txt xvfb-run -a "$AI" --appimage-extract-and-run $GL > /tmp/run1.log 2>&1 || true
+          cat /tmp/smoke1.txt || { echo "AppImage: no smoke result"; tail -40 /tmp/run1.log; exit 1; }
+          grep -q "SMOKE OK" /tmp/smoke1.txt
+          sudo apt-get install -y -qq ./inst/*.deb > /dev/null
+          which vseilinichego
+          VSE_SMOKE=/tmp/smoke2.txt xvfb-run -a vseilinichego $GL > /tmp/run2.log 2>&1 || true
+          cat /tmp/smoke2.txt || { echo "deb: no smoke result"; tail -40 /tmp/run2.log; exit 1; }
+          grep -q "SMOKE OK" /tmp/smoke2.txt
+
+  test-windows:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: installers-Windows, path: inst }
+      - name: install silently, start, uninstall
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem inst -Filter *.exe | Select-Object -First 1
+          Start-Process -Wait -FilePath $exe.FullName -ArgumentList '/S', '/D=C:\vse'
+          Get-ChildItem C:\vse -Filter *.exe | Format-Table Name, Length
+          $env:VSE_SMOKE = 'C:\smoke.txt'
+          Start-Process -Wait -FilePath 'C:\vse\VseIliNichego.exe' -ArgumentList '--ignore-gpu-blocklist', '--enable-unsafe-swiftshader'
+          if (!(Test-Path C:\smoke.txt)) { Write-Error 'no smoke result'; exit 1 }
+          Get-Content C:\smoke.txt
+          if (!(Select-String -Path C:\smoke.txt -Pattern 'SMOKE OK' -Quiet)) { exit 1 }
+          $un = Get-ChildItem C:\vse -Filter 'Uninstall*.exe' | Select-Object -First 1
+          Start-Process -Wait -FilePath $un.FullName -ArgumentList '/S'
+          Write-Host 'uninstalled'
