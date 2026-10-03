@@ -1,6 +1,6 @@
 # PUBLIC BUILD of «ВСЁ ИЛИ НИЧЕГО» (free GitHub Actions minutes for a public repo). The source stays private: each job
 # checks out kaufmanbora-lang/vseilinichego with a read-only deploy key (secret SRC_DEPLOY_KEY). Generated from the
-# private repo's .github/workflows/release.yml by its scripts — do not edit here by hand.
+# private repo's .github/workflows/release.yml by scripts/ci/mkpubwf.mjs — do not edit here by hand.
 #   gh workflow run build.yml -R kaufmanbora-lang/vseilinichego-releases [-f ref=main]
 # Installers for Windows (NSIS), macOS (dmg, universal: Intel + Apple Silicon) and Linux (AppImage + deb), built on
 # GitHub's machines, then INSTALLED AND STARTED on clean machines of several versions of each system: the app runs with
@@ -143,8 +143,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-        with: { repository: kaufmanbora-lang/vseilinichego, ref: '${{ inputs.ref }}', ssh-key: '${{ secrets.SRC_DEPLOY_KEY }}', persist-credentials: false }
-        with: { sparse-checkout: scripts/ci }
+        with: { sparse-checkout: scripts/ci, repository: kaufmanbora-lang/vseilinichego, ref: '${{ inputs.ref }}', ssh-key: '${{ secrets.SRC_DEPLOY_KEY }}', persist-credentials: false }
       - uses: actions/download-artifact@v4
         with: { name: installers-macOS, path: inst }
       - uses: actions/download-artifact@v4
