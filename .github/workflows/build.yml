@@ -9,8 +9,12 @@
 # macOS also gets the signed update feed (latest-mac.yml.sig, key = secret MAC_FEED_KEY) and, with e2e_update, a full
 # update test: a second build one patch version up is served from a local feed and the installed game updates itself
 # (scripts/ci/mac-update-e2e.sh).
+# Windows also builds the HOST's app (scripts/release.mjs --host: «Всё или ничего — Ведущий», its own app id, folder, data
+# and update feed <base>/dl/host/ = latest-host.yml) → artifact installer-host-Windows; test-windows installs it NEXT TO the
+# players' app and starts both at once (no clash), then uninstalls both.
 # Run: gh workflow run release.yml   → the files are the run's artifacts (gh run download), published by hand
-# (a macOS release needs the dmg, the zip, latest-mac.yml AND latest-mac.yml.sig of the same run).
+# (a macOS release needs the dmg, the zip, latest-mac.yml AND latest-mac.yml.sig of the same run; the host's three files
+# VseIliNichego-Host-<ver>-win-x64.exe, its .blockmap and latest-host.yml go into the same release).
 name: release
 on:
   workflow_dispatch:
@@ -93,6 +97,19 @@ jobs:
             dist/release/latest*.yml
             dist/release/*.sig
             dist/release/*.blockmap
+      # the host's app (Windows only): built after the players' files are uploaded (it stages dist/app again)
+      - name: the host's app — its own installer and update feed (latest-host.yml)
+        if: runner.os == 'Windows'
+        run: node scripts/release.mjs --host --base "${{ inputs.base }}"
+        env: { CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: installer-host-Windows
+          path: |
+            dist/release-host/*.exe
+            dist/release-host/*.blockmap
+            dist/release-host/latest-host.yml
 
   test-macos:
     needs: build
@@ -198,7 +215,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { name: installers-Windows, path: inst }
-      - name: install silently, start, uninstall
+      - uses: actions/download-artifact@v4
+        with: { name: installer-host-Windows, path: insthost }
+      - name: install silently, start
         shell: pwsh
         run: |
           $exe = Get-ChildItem inst -Filter *.exe | Select-Object -First 1
@@ -209,6 +228,43 @@ jobs:
           if (!(Test-Path C:\smoke.txt)) { Write-Error 'no smoke result'; exit 1 }
           Get-Content C:\smoke.txt
           if (!(Select-String -Path C:\smoke.txt -Pattern 'SMOKE OK' -Quiet)) { exit 1 }
-          $un = Get-ChildItem C:\vse -Filter 'Uninstall*.exe' | Select-Object -First 1
-          Start-Process -Wait -FilePath $un.FullName -ArgumentList '/S'
-          Write-Host 'uninstalled'
+      - name: the host's app next to the players' — install (default per-user folder), start both at once, uninstall both
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem insthost -Filter 'VseIliNichego-Host-*.exe' | Select-Object -First 1
+          Start-Process -Wait -FilePath $exe.FullName -ArgumentList '/S'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\HostVseIliNichego'
+          if (!(Test-Path "$dir\HostVseIliNichego.exe")) { Write-Error "the host's app is not in $dir"; exit 1 }
+          Get-Content "$dir\resources\app-update.yml"
+          if (!(Select-String "$dir\resources\app-update.yml" -Pattern '/dl/host$' -Quiet)) { Write-Error 'the host app does not update from /dl/host'; exit 1 }
+          Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", ([Environment]::GetFolderPath('Desktop')) -Filter '*.lnk' | Format-Table Name
+          # both apps at the same time: separate data folders and single-instance locks, so each one must start
+          $GL = '--ignore-gpu-blocklist', '--enable-unsafe-swiftshader'
+          $env:VSE_SMOKE = 'C:\smoke-host.txt'; $h = Start-Process -PassThru -FilePath "$dir\HostVseIliNichego.exe" -ArgumentList $GL
+          $env:VSE_SMOKE = 'C:\smoke-both.txt'; $p = Start-Process -PassThru -FilePath 'C:\vse\VseIliNichego.exe' -ArgumentList $GL
+          # a players' installer / updater / uninstaller closes every process whose path starts with its folder (default
+          # …\Programs\VseIliNichego): the running host app must never be one of them
+          Start-Sleep 3
+          $closes = @(Get-CimInstance Win32_Process | Where-Object { $_.Path -and $_.Path.StartsWith((Join-Path $env:LOCALAPPDATA 'Programs\VseIliNichego'), 'CurrentCultureIgnoreCase') } | ForEach-Object { $_.Path })
+          if ($closes | Where-Object { $_ -like "$dir\*" }) { Write-Error "a players' installer would close the host app: $closes"; exit 1 }
+          $h, $p | Wait-Process -Timeout 200
+          $res = @{}
+          foreach ($f in 'C:\smoke-host.txt', 'C:\smoke-both.txt') {
+            if (!(Test-Path $f)) { Write-Error "no smoke result $f"; exit 1 }
+            $line = (Get-Content $f -Raw -Encoding utf8).Trim(); Write-Host $line
+            if (!$line.StartsWith('SMOKE OK ')) { exit 1 }
+            $res[$f] = $line.Substring(9) | ConvertFrom-Json
+          }
+          # the host's first start (no key yet) asks for the host key; the data folders differ
+          if (!$res['C:\smoke-host.txt'].ask) { Write-Error 'the host app did not ask for the host key'; exit 1 }
+          if ($res['C:\smoke-host.txt'].data -eq $res['C:\smoke-both.txt'].data) { Write-Error 'the same data folder for both apps'; exit 1 }
+          # uninstall both (the NSIS uninstaller re-runs itself from TEMP: wait until the files are gone)
+          foreach ($d in $dir, 'C:\vse') {
+            $un = Get-ChildItem $d -Filter 'Uninstall*.exe' | Select-Object -First 1
+            Start-Process -Wait -FilePath $un.FullName -ArgumentList '/S'
+          }
+          for ($i = 0; $i -lt 60 -and ((Test-Path "$dir\HostVseIliNichego.exe") -or (Test-Path 'C:\vse\VseIliNichego.exe')); $i++) { Start-Sleep 1 }
+          if ((Test-Path "$dir\HostVseIliNichego.exe") -or (Test-Path 'C:\vse\VseIliNichego.exe')) { Write-Error 'not uninstalled'; exit 1 }
+          $left = Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall | Where-Object { (Get-ItemProperty $_.PsPath).DisplayName -match 'Всё или ничего' }
+          if ($left) { Write-Error 'uninstall entries left'; exit 1 }
+          Write-Host 'both uninstalled'
